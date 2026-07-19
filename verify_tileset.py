@@ -3,10 +3,15 @@
 Usage
 -----
 python verify_tileset.py path/to/out_dir/
+
+Optional: python verify_tileset.py path/to/out_dir/ --geoid-model egm2008-2_5
+to also print orthometric height at the bbox center (informational only,
+grid downloaded automatically on first use).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import struct
@@ -83,11 +88,15 @@ def check(label, ok, detail=""):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python verify_tileset.py <out_dir>")
-        sys.exit(1)
+    ap = argparse.ArgumentParser(description="Sanity-check a finished tileset.")
+    ap.add_argument("out_dir", type=Path)
+    ap.add_argument("--geoid-model", default=None,
+                    choices=["egm96-5", "egm2008-5", "egm2008-2_5", "egm2008-1"],
+                    help="(optional) also print orthometric height at bbox "
+                         "center using this geoid model (informational only)")
+    args = ap.parse_args()
 
-    out_dir = Path(sys.argv[1])
+    out_dir = args.out_dir
     passed = 0
     total  = 0
 
@@ -155,6 +164,15 @@ def main():
 
     print(f"\n  Bbox center (WGS84) : lat={lat:.6f}, lon={lon:.6f}, alt={alt:.1f} m")
     print(f"  Bbox center (UTM)   : {easting:.2f} E, {northing:.2f} N, zone {zone}{hemi}")
+
+    if args.geoid_model and T:
+        from geoid_model import get_geoid_undulation, GeoidModelError
+        try:
+            N = get_geoid_undulation(lat, lon, model=args.geoid_model)
+            print(f"  Geoid ({args.geoid_model}) : N={N:+.3f} m, "
+                  f"orthometric alt={alt - N:.1f} m (ellipsoidal {alt:.1f} m)")
+        except GeoidModelError as exc:
+            print(f"  Geoid ({args.geoid_model}) : WARNING could not compute — {exc}")
 
     # ── GLB tiles ─────────────────────────────────────────────────────────────
     tiles = sorted(out_dir.glob("tile_*.glb"))

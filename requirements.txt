@@ -1,1 +1,2 @@
 numpy>=1.24.0
+pygeodesy>=24.0.0  # optional: only required for --geoid-model in solve_transform.py / verify_tileset.py

@@ -222,4 +222,7 @@ def solve_ply_to_ecef(
         "rmse_m":      float(rmse),
         "n_inliers":   n_inliers,
         "n_total":     n_matched,
+        "centroid_lat": lat_c,
+        "centroid_lon": lon_c,
+        "centroid_alt_ellipsoidal_m": alt_c,
     }
