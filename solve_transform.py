@@ -12,9 +12,17 @@ terrain altitude in the output (printed only, not used in solve).
 
 Optional: add --geoid-model {egm96-5,egm2008-5,egm2008-2_5,egm2008-1} to
 also compute geoid undulation (N) and orthometric height at the scene
-centroid. The grid file is downloaded automatically on first use. This is
-informational only — the similarity transform itself always operates on
-ellipsoidal (WGS84/GPS) heights.
+centroid. The grid file is downloaded automatically on first use. By
+default this is informational only — the similarity transform itself
+still operates on ellipsoidal (WGS84/GPS) heights.
+
+Optional: add --apply-geoid-correction (requires --geoid-model) to shift
+the transform's translation vector so the output tiles are placed at
+orthometric height instead of ellipsoidal. The shift is computed once at
+the scene centroid and applied uniformly — a good approximation for
+scenes up to a few km across, since geoid undulation varies smoothly over
+much larger distances. Without this flag, output is unchanged (ellipsoidal),
+exactly like before --geoid-model existed.
 """
 
 from __future__ import annotations
@@ -24,9 +32,11 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from colmap_reader import read_images_bin, read_points3d_bin
 from metashape_parser import parse_metashape_xml, MetashapeXMLError
-from transform_solver import solve_ply_to_ecef, ecef_to_geodetic
+from transform_solver import solve_ply_to_ecef, ecef_to_geodetic, geodetic_to_ecef
 from geoid_model import get_geoid_undulation, GeoidModelError, GEOID_MODELS
 
 
@@ -49,7 +59,13 @@ def main() -> int:
     ap.add_argument("--geoid-model", default=None, choices=list(GEOID_MODELS),
                     help="(optional) also compute geoid undulation/orthometric "
                          "height at the scene centroid using this model")
+    ap.add_argument("--apply-geoid-correction", action="store_true",
+                    help="shift the transform to place output at orthometric "
+                         "height instead of ellipsoidal (requires --geoid-model)")
     args = ap.parse_args()
+
+    if args.apply_geoid_correction and not args.geoid_model:
+        ap.error("--apply-geoid-correction requires --geoid-model to be set")
 
     # ── 1. Read COLMAP cameras ────────────────────────────────────────────────
     print(f"Reading COLMAP images.bin: {args.images_bin}")
@@ -95,6 +111,7 @@ def main() -> int:
 
     # ── 5. Optional geoid undulation at scene centroid ───────────────────────
     geoid_info = None
+    translation = result["translation"]
     if args.geoid_model:
         lat_c = result["centroid_lat"]
         lon_c = result["centroid_lon"]
@@ -102,22 +119,43 @@ def main() -> int:
         print(f"Computing geoid undulation ({args.geoid_model}) at scene centroid …")
         try:
             N = get_geoid_undulation(lat_c, lon_c, model=args.geoid_model)
+            orthometric_alt = alt_c - N
             geoid_info = {
                 "model": args.geoid_model,
                 "undulation_m": N,
                 "ellipsoidal_height_m": alt_c,
-                "orthometric_height_m": alt_c - N,
+                "orthometric_height_m": orthometric_alt,
+                "applied_to_transform": False,
             }
             print(f"  N (undulation)     = {N:+.3f} m")
-            print(f"  orthometric height = {alt_c - N:.2f} m (ellipsoidal {alt_c:.2f} m)")
+            print(f"  orthometric height = {orthometric_alt:.2f} m (ellipsoidal {alt_c:.2f} m)")
+
+            if args.apply_geoid_correction:
+                # ECEF shift = position at orthometric height − position at
+                # ellipsoidal height, both evaluated at the same lat/lon.
+                # Applying this same shift across the whole scene is a good
+                # approximation since geoid undulation varies smoothly over
+                # distances much larger than a typical scene extent.
+                ecef_ellipsoidal = geodetic_to_ecef(lat_c, lon_c, alt_c)
+                ecef_orthometric = geodetic_to_ecef(lat_c, lon_c, orthometric_alt)
+                shift = ecef_orthometric - ecef_ellipsoidal
+                translation = (np.array(translation) + shift).tolist()
+                geoid_info["applied_to_transform"] = True
+                geoid_info["ecef_shift_m"] = shift.tolist()
+                print(f"  Applied to transform: translation shifted by "
+                      f"{np.linalg.norm(shift):.3f} m (orthometric output)")
         except GeoidModelError as exc:
             print(f"  WARNING: could not compute geoid undulation: {exc}")
+            if args.apply_geoid_correction:
+                print("  ERROR: --apply-geoid-correction requires a valid geoid "
+                      "undulation — aborting without writing output.", file=sys.stderr)
+                return 1
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
     payload = {
         "scale":       result["scale"],
         "rotation":    result["rotation"],
-        "translation": result["translation"],
+        "translation": translation,
         "rmse_m":      result["rmse_m"],
         "n_inliers":   result["n_inliers"],
         "n_total":     result["n_total"],
