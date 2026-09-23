@@ -1,4 +1,4 @@
-# georeference_3dtiles_gaussian_splatting
+# 3dtiles_georeference_3dgs
 
 Standalone Python pipeline for converting 3D Gaussian Splatting reconstructions into georeferenced 3D Tiles 1.1 (SPZ-compressed) ready for Cesium ion and CesiumJS — without requiring LichtFeld Studio.
 
@@ -16,6 +16,8 @@ Tested on three real-world drone datasets in (ITB Ganesha Bandung, Taman Kota Ci
 - Octree-based spatial tiling
 - Supports WGS84 (GEOGCS) and UTM (PROJCS) Metashape exports
 - Optional sparse-point verification using points3D.bin
+- Optional geoid correction (EGM96 / EGM2008) to orthometric height
+- Optional single-file `.3tz` packaging
 - Fully reproducible command-line workflow
 
 ---
@@ -100,11 +102,13 @@ Metashape XML ──→ GPS ECEF ────────────┘        
 pip install -r requirements.txt
 ```
 
-Current dependency:
+| Package | Required for |
+|---|---|
+| `numpy` | everything (required) |
+| `pygeodesy` | `--geoid-model` in `solve_transform.py` / `verify_tileset.py` (optional) |
+| `pyshp`, `pyproj`, `matplotlib` | tools in [`crop/`](crop/README.md) (optional) |
 
-```
-numpy >= 1.24
-```
+`.3tz` packaging (Step 5) additionally requires [Node.js](https://nodejs.org) (LTS).
 
 ---
 
@@ -169,6 +173,38 @@ scale       = 1.00000000
 RMSE (GPS)  = 0.0222 m
 inliers     = 1146/1146
 ```
+
+#### Optional — Geoid undulation and orthometric height
+
+```bash
+python solve_transform.py \
+    --images-bin sparse/0/images.bin \
+    --metashape camera_export.xml \
+    --output similarity_transform.json \
+    --geoid-model egm2008-2_5 \
+    --apply-geoid-correction
+```
+
+| Flag | Description |
+|---|---|
+| `--geoid-model` | `egm96-5`, `egm2008-5`, `egm2008-2_5`, `egm2008-1`. Computes the geoid undulation N and orthometric height at the scene centroid and prints them. Informational only unless `--apply-geoid-correction` is also given. |
+| `--apply-geoid-correction` | Shifts the transform's translation so the output is placed at **orthometric** height instead of ellipsoidal. Requires `--geoid-model`. |
+
+- Geoid grids are downloaded automatically from the GeographicLib distribution
+  on first use and cached in `geoids/` (override with the `GEOID_DATA_DIR`
+  environment variable). `egm96-5` and `egm2008-2_5` are already included in
+  the repo.
+- The correction is a single ECEF shift computed at the scene centroid and
+  applied uniformly to the whole scene. This is a close approximation for
+  scenes up to a few km across, since the geoid varies smoothly over much
+  larger distances.
+- Without `--apply-geoid-correction` the output is ellipsoidal (WGS84 / GPS
+  heights), exactly as before. Only apply the correction when the rest of your
+  scene (terrain, meshes, CityGML) uses orthometric heights.
+- When applied, `similarity_transform.json` contains a `geoid` block with
+  `"applied_to_transform": true`, the model, N, and the ECEF shift.
+- `verify_tileset.py` also accepts `--geoid-model` to print N at the tileset
+  centre (informational only).
 
 ### Step 2 — Export 3D Tiles
 
@@ -289,6 +325,48 @@ viewer.screenSpaceEventHandler.setInputAction(async (click) => {
 }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 ```
 
+### Step 5 (optional) — Package as a single `.3tz` file
+
+The output folder can be packaged into one `.3tz` file (a 3D Tiles package
+based on ZIP) with [3d-tiles-tools](https://github.com/CesiumGS/3d-tiles-tools).
+The tiles themselves are not modified.
+
+```bash
+npx 3d-tiles-tools convert -i output_tiles/ -o output_tiles.3tz
+```
+
+- The output path must end in `.3tz` and must not already exist
+  (add `-f` to overwrite).
+- On first run, `npx` asks to download `3d-tiles-tools` — answer `y`.
+- `npm warn deprecated ...` messages come from the tool's dependencies and
+  can be ignored.
+
+| Platform | `.3tz` support |
+|---|---|
+| ArcGIS Pro 3.7 | Verified (ITB Ganesha): Add Data → `.3tz` in a scene loads as a Gaussian splat layer |
+| Cesium ion | Not yet verified. A `.3tz` is a ZIP file; renaming it to `.zip` and uploading as 3D Tiles is reported to work for regular tilesets ([Cesium Community](https://community.cesium.com/t/how-to-upload-3tz-file-to-cesium-ion/40313)) |
+| CesiumJS (direct) | Not supported — extract the `.3tz` (it is a ZIP) and serve the folder ([Cesium Community](https://community.cesium.com/t/how-to-load-3tz/37419)) |
+
+---
+
+## Optional Tools
+
+### Crop & Georeferenced PLY Export — [`crop/`](crop/README.md)
+
+- `crop_ply_by_boundary.py` — crop the local-frame PLY with a real-world UTM
+  boundary polygon. The cropped PLY stays in the local frame and can go
+  straight into `tiles_exporter.py` with the same transform.
+- `export_georeferenced_ply.py` — export a UTM-offset georeferenced PLY
+  (position, rotation and scale transformed) for 3DGS viewers.
+
+Requires `pyshp`, `pyproj` and `matplotlib`. See [`crop/README.md`](crop/README.md).
+
+### Experimental — [`experimental/`](experimental/README.md)
+
+Design prototypes that are not part of the supported pipeline, with their
+motivation, literature and test results. Currently: a 2-level additive LOD
+(`refine: ADD`) prototype. See [`experimental/README.md`](experimental/README.md).
+
 ---
 
 ## Validation Result
@@ -327,7 +405,7 @@ against ground truth measurements.
 ## File Structure
 
 ```
-georeference_3dtiles_gaussian_splatting/
+3dtiles_georeference_3dgs/
 ├── solve_transform.py
 ├── tiles_exporter.py
 ├── verify_tileset.py
@@ -335,6 +413,15 @@ georeference_3dtiles_gaussian_splatting/
 ├── metashape_parser.py
 ├── transform_solver.py
 ├── spz_encode.py
+├── geoid_model.py
+├── geoids/                     # cached EGM geoid grids
+├── crop/
+│   ├── README.md
+│   ├── crop_ply_by_boundary.py
+│   └── export_georeferenced_ply.py
+├── experimental/
+│   ├── README.md
+│   └── prototype_pyramid_add.py
 ├── requirements.txt
 ├── README.md
 ├── PIPELINE_DEBUG_LOG.md
@@ -386,8 +473,11 @@ positions, not independently verified ground truth. Validation with independent 
 is recommended for production use.
 
 
-**Geoid correction (EGM96)** — not implemented. GPS PPK outputs ellipsoidal height
-(WGS84), which this pipeline uses directly.
+**Geoid correction** — available via `--geoid-model` / `--apply-geoid-correction`
+(Step 1). It uses a single undulation value at the scene centroid, applied
+uniformly; very large scenes would need a per-point correction. Only global
+models (EGM96, EGM2008) are supported. InaGeoid is not supported yet because it
+is distributed as a login-gated point-query service, not a downloadable grid.
 
 ---
 
