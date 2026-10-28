@@ -2,6 +2,7 @@
 # https://github.com/dozeri83/geo-register-plugin
 # Original licensed under GPL-3.0
 # Modifications by wahyunanandika — June 2026
+# Hierarchical LOD option + tileset writer split — October 2026
 """Export a geo-registered 3DGS PLY to 3D Tiles 1.1 (SPZ-compressed GLB).
 
 Usage (CLI)
@@ -10,9 +11,14 @@ python tiles_exporter.py splat.ply similarity_transform.json out_dir/ [options]
 
 Options
 -------
---max-sh-degree  0|1|2|3   SH degree to include (default: 3)
---max-splats-per-tile INT   Override auto tile-size limit
+--tiling flat|lod           flat = octree, content in leaves only (default, unchanged)
+                            lod  = hierarchical LOD: every node has content (see lod_tiling.py)
+--tiles-version 1.1         3D Tiles version of tileset.json (2.0 reserved, not ratified yet)
+--max-sh-degree  0|1|2|3    SH degree to include (default: 3)
+--max-splats-per-tile INT   Override auto tile-size limit (also the per-tile budget in lod mode)
 --min-tile-size FLOAT       Min octree cell diameter in scene units (default: 0.1)
+--error-scale FLOAT         lod: geometricError multiplier (default: 16)
+--lod-max-inflate FLOAT     lod: max enlargement of a kept splat per level (default: 2)
 --fraction FLOAT            Sub-sample fraction for quick tests (0 < f ≤ 1)
 """
 
@@ -25,7 +31,10 @@ from pathlib import Path
 
 import numpy as np
 
+import lod_tiling
 from spz_encode import DIM_FOR_DEGREE, encode_spz_v3
+from tileset_writer import (PLANNED_VERSIONS, SUPPORTED_VERSIONS, box_from_bounds,
+                            root_transform, tileset_document)
 
 GLB_MAGIC  = 0x46546C67
 CHUNK_JSON = 0x4E4F534A
@@ -204,15 +213,8 @@ def _assign_tile_ids(node, counter):
 
 
 def _node_to_tile_dict(node):
-    c = node.center.tolist()
-    h = node.half_axes.tolist()
     tile = {
-        "boundingVolume": {"box": [
-            c[0], c[1], c[2],
-            h[0], 0.0,  0.0,
-            0.0,  h[1], 0.0,
-            0.0,  0.0,  h[2],
-        ]},
+        "boundingVolume": {"box": box_from_bounds(node.pmin, node.pmax)},
         "geometricError": 0.0 if node.is_leaf else node.geometric_error,
         "refine": "REPLACE",
     }
@@ -225,50 +227,31 @@ def _node_to_tile_dict(node):
 
 # ─── Tileset builder ──────────────────────────────────────────────────────────
 
-def _build_tileset_tiled(sim: dict, root_node: _OctreeNode) -> dict:
-    s = float(sim["scale"])
-    R = np.array(sim["rotation"], dtype=np.float64).reshape(3, 3)
-    t = np.array(sim["translation"], dtype=np.float64)
-
-    # Similarity matrix: COLMAP world space → ECEF (no Y/Z flip needed —
-    # the flip was for LFS visualizer-world convention, not COLMAP space)
-    M = np.eye(4, dtype=np.float64)
-    M[:3, :3] = s * R
-    M[:3, 3]  = t
-
-    pmin = root_node.pmin
-    pmax = root_node.pmax
-    center = (pmin + pmax) * 0.5
-    half   = (pmax - pmin) * 0.5
-    geom_err = float(np.linalg.norm(pmax - pmin))
+def _build_tileset_tiled(sim: dict, root_node: _OctreeNode, version: str = "1.1") -> dict:
+    """Flat octree tileset (content in leaves only)."""
+    geom_err = float(np.linalg.norm(root_node.pmax - root_node.pmin))
 
     root_tile = _node_to_tile_dict(root_node)
-    root_tile["transform"]      = M.T.flatten().tolist()
+    # Similarity matrix: COLMAP world space → ECEF (no Y/Z flip needed —
+    # the flip was for LFS visualizer-world convention, not COLMAP space)
+    root_tile["transform"]      = root_transform(sim)
     root_tile["geometricError"] = geom_err
-    root_tile["boundingVolume"] = {"box": [
-        float(center[0]), float(center[1]), float(center[2]),
-        float(half[0]),   0.0,              0.0,
-        0.0,              float(half[1]),   0.0,
-        0.0,              0.0,              float(half[2]),
-    ]}
+    root_tile["boundingVolume"] = {"box": box_from_bounds(root_node.pmin, root_node.pmax)}
 
-    return {
-        "asset": {"version": "1.1"},
-        "extensionsUsed":     ["3DTILES_content_gltf"],
-        "extensionsRequired": ["3DTILES_content_gltf"],
-        "extensions": {"3DTILES_content_gltf": {
-            "extensionsUsed": [
-                "KHR_gaussian_splatting",
-                "KHR_gaussian_splatting_compression_spz_2",
-            ],
-            "extensionsRequired": [
-                "KHR_gaussian_splatting",
-                "KHR_gaussian_splatting_compression_spz_2",
-            ],
-        }},
-        "geometricError": geom_err,
-        "root": root_tile,
-    }
+    return tileset_document(root_tile, geom_err, version)
+
+
+def _build_tileset_lod(sim: dict, root_node: _OctreeNode, version: str = "1.1") -> dict:
+    """Hierarchical LOD tileset (content in every node).
+
+    geometricError stays in scene units, as in the flat tileset: the viewer
+    applies the root transform's scale itself.
+    """
+    diag = float(np.linalg.norm(root_node.pmax - root_node.pmin))
+    root_tile = lod_tiling.node_to_tile_dict(root_node, box_from_bounds)
+    root_tile["transform"] = root_transform(sim)
+    # Beyond this error the whole tileset is skipped; keep it >= the root's own error.
+    return tileset_document(root_tile, max(diag, root_node.lod_error), version)
 
 
 # ─── PLY reader ───────────────────────────────────────────────────────────────
@@ -351,8 +334,21 @@ def export_tiles(
     max_splats_per_tile: int  = 0,
     min_tile_size:       float = 0.1,
     progress_cb          = None,
-) -> None:
-    """Write tileset.json + tile_XXXX.glb files to out_dir."""
+    tiling:              str   = "flat",
+    tiles_version:       str   = "1.1",
+    error_scale:         float = lod_tiling.DEFAULT_ERROR_SCALE,
+    lod_max_inflate:     float = lod_tiling.DEFAULT_MAX_INFLATE,
+) -> dict:
+    """Write tileset.json + tiles to out_dir.
+
+    tiling="flat": tile_XXXX.glb, content in octree leaves only (original behaviour).
+    tiling="lod" : tiles/D<depth>/NNNNNN.glb, content in every octree node.
+    Returns a small summary dict.
+    """
+    if tiling not in ("flat", "lod"):
+        raise ValueError(f"tiling must be 'flat' or 'lod', got {tiling!r}")
+    # Fail before any heavy work if the requested version has no writer.
+    tileset_document({}, 0.0, tiles_version)
 
     def prog(f):
         if progress_cb:
@@ -385,25 +381,58 @@ def export_tiles(
 
     prog(0.15)
 
-    for i, leaf in enumerate(leaves):
-        idx = leaf.indices
+    def write_tile(path: Path, idx: np.ndarray, dlog: np.ndarray | None = None) -> None:
+        sl = scales_log[idx].astype(np.float32)
+        if dlog is not None:
+            sl = sl + dlog[:, None]
         spz = encode_spz_v3(
             positions      = positions[idx],
             rotations_xyzw = rotations_xyzw[idx],
-            scales_log     = scales_log[idx].astype(np.float32),
+            scales_log     = sl,
             opacity_logit  = opacity_logit[idx].astype(np.float32),
             f_dc           = f_dc[idx].astype(np.float32),
             f_rest_rgb     = f_rest_rgb[idx] if f_rest_rgb is not None else None,
             sh_degree      = sh_degree,
         )
-        _write_spz_glb(out_dir / leaf.tile_id, spz,
-                       int(len(idx)), sh_degree, positions[idx])
-        prog(0.15 + 0.75 * (i + 1) / len(leaves))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_spz_glb(path, spz, int(len(idx)), sh_degree, positions[idx])
 
-    tileset = _build_tileset_tiled(transform, root_node)
+    if tiling == "flat":
+        for i, leaf in enumerate(leaves):
+            write_tile(out_dir / leaf.tile_id, leaf.indices)
+            prog(0.15 + 0.75 * (i + 1) / len(leaves))
+        tileset = _build_tileset_tiled(transform, root_node, tiles_version)
+        summary = {"tiling": "flat", "tiles": len(leaves), "splats_written": n_total}
+    else:
+        internal = lod_tiling.build_hlod(
+            root_node, positions, scales_log, opacity_logit, effective,
+            max_inflate=lod_max_inflate,
+            progress_cb=lambda f: prog(0.15 + 0.15 * f))
+        lod_tiling.assign_errors(root_node, scales_log, error_scale)
+        nodes = lod_tiling.assign_uris(root_node)
+        per_depth: dict[int, list[int]] = {}
+        written = 0
+        # coarse first, so a cancelled run still leaves the top of the tree
+        for i, node in enumerate(sorted(nodes, key=lambda n: n.depth)):
+            dlog = None if node.is_leaf else node.lod_dlog
+            write_tile(out_dir / node.tile_id, node.lod_idx, dlog)
+            per_depth.setdefault(node.depth, [0, 0])
+            per_depth[node.depth][0] += 1
+            per_depth[node.depth][1] += len(node.lod_idx)
+            written += len(node.lod_idx)
+            prog(0.30 + 0.65 * (i + 1) / len(nodes))
+        print(f"\n  hlod: {len(internal)} internal + {len(leaves)} leaf tiles, "
+              f"{written:,} splats written ({written / n_total:.2f}x input)")
+        for d, (nt, ns) in sorted(per_depth.items()):
+            print(f"    D{d}: {nt:5d} tiles, {ns:>11,} splats")
+        tileset = _build_tileset_lod(transform, root_node, tiles_version)
+        summary = {"tiling": "lod", "tiles": len(nodes), "splats_written": written,
+                   "per_depth": {d: {"tiles": v[0], "splats": v[1]} for d, v in per_depth.items()}}
+
     with open(out_dir / "tileset.json", "w", encoding="utf-8") as f:
         json.dump(tileset, f, indent=2)
     prog(1.0)
+    return summary
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -421,6 +450,14 @@ def main():
     ap.add_argument("--max-sh-degree",       type=int,   choices=[0,1,2,3], default=3)
     ap.add_argument("--max-splats-per-tile", type=int,   default=0)
     ap.add_argument("--min-tile-size",       type=float, default=0.1)
+    ap.add_argument("--tiling",              choices=["flat", "lod"], default="flat",
+                    help="flat = content in octree leaves only; lod = hierarchical LOD")
+    ap.add_argument("--tiles-version",       choices=list(SUPPORTED_VERSIONS + PLANNED_VERSIONS),
+                    default="1.1", help="3D Tiles version (2.0 reserved until ratified)")
+    ap.add_argument("--error-scale",         type=float, default=lod_tiling.DEFAULT_ERROR_SCALE,
+                    help="lod: geometricError multiplier (higher = refine sooner)")
+    ap.add_argument("--lod-max-inflate",     type=float, default=lod_tiling.DEFAULT_MAX_INFLATE,
+                    help="lod: max enlargement of a kept splat per level")
     ap.add_argument("--fraction",            type=float, default=1.0,
                     help="Sub-sample fraction for quick tests (0 < f ≤ 1)")
     ap.add_argument("--seed",                type=int,   default=0)
@@ -464,7 +501,7 @@ def main():
     def log_prog(f):
         print(f"  {int(f * 100):3d}%", end="\r", flush=True)
 
-    export_tiles(
+    summary = export_tiles(
         positions          = positions,
         rotations_wxyz     = rotations_wxyz,
         scales_log         = scales_log,
@@ -477,8 +514,12 @@ def main():
         max_splats_per_tile= args.max_splats_per_tile,
         min_tile_size      = args.min_tile_size,
         progress_cb        = log_prog,
+        tiling             = args.tiling,
+        tiles_version      = args.tiles_version,
+        error_scale        = args.error_scale,
+        lod_max_inflate    = args.lod_max_inflate,
     )
-    print(f"\nDone → {args.out_dir}/tileset.json + {len(list(args.out_dir.glob('tile_*.glb')))} tiles")
+    print(f"\nDone → {args.out_dir}/tileset.json + {summary['tiles']} tiles")
 
 
 if __name__ == "__main__":

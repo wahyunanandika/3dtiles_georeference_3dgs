@@ -2,7 +2,7 @@
 
 Standalone Python pipeline for converting 3D Gaussian Splatting reconstructions into georeferenced 3D Tiles 1.1 (SPZ-compressed) ready for Cesium ion and CesiumJS — without requiring LichtFeld Studio.
 
-Tested on three real-world drone datasets in (ITB Ganesha Bandung, Taman Kota Cimahi, Jatinangor), West Java, Indonesia. Horizontal positioning appears consistent with GPS PPK references. Further geodetic validation with independent checkpoints is recommended.
+Tested on three real-world drone datasets in (ITB Ganesha Bandung, Taman Kota Cimahi, Jatinangor), West Java, Indonesia. Horizontal positioning appears consistent with GPS PPK references. On visual inspection, the exported 3D Tiles also snap onto the photogrammetric mesh of the same dataset; further validation will follow. Further geodetic validation with independent checkpoints is recommended.
 
 ---
 
@@ -13,7 +13,10 @@ Tested on three real-world drone datasets in (ITB Ganesha Bandung, Taman Kota Ci
 - SPZ-compressed Gaussian Splats
 - 3D Tiles 1.1 export
 - Cesium ion compatible
-- Octree-based spatial tiling
+- Two tiling modes, selectable per export:
+  - **flat** — octree tiling, splats in leaf tiles only (default)
+  - **lod** — hierarchical level of detail: every octree node carries a reduced
+    copy of its subtree
 - Supports WGS84 (GEOGCS) and UTM (PROJCS) Metashape exports
 - Optional sparse-point verification using points3D.bin
 - Optional geoid correction (EGM96 / EGM2008) to orthometric height
@@ -70,6 +73,11 @@ parsed directly from the Metashape WKT string. All UTM zones (1–60, N/S) are s
 **Added `points3D.bin` reader** — optional verification of terrain altitude before
 running the full tile export.
 
+**Added hierarchical LOD tiling (`--tiling lod`)** — standalone, no LichtFeld Studio.
+dozeri's plugin now builds LOD levels with LichtFeld Studio (`lf.io.save_ssog`);
+this pipeline builds them in numpy on top of its own octree (see
+[Tiling modes](#tiling-modes)). The flat octree mode is unchanged and remains the default.
+
 ---
 
 ## Pipeline Overview
@@ -83,6 +91,7 @@ Metashape XML ──→ GPS ECEF ────────────┘        
                                                                         │
                                                                         ▼
                                                                  Octree Tiling
+                                                            (flat or hierarchical LOD)
                                                                         │
                                                                         ▼
                                                                   SPZ Encoding
@@ -215,12 +224,48 @@ python tiles_exporter.py \
     output_tiles/
 ```
 
+Hierarchical LOD:
+
+```bash
+python tiles_exporter.py \
+    splat.ply \
+    similarity_transform.json \
+    output_tiles_lod/ \
+    --tiling lod
+```
+
 | Parameter | Description |
 |---|---|
+| `--tiling` | `flat` (default) or `lod` — see [Tiling modes](#tiling-modes) |
+| `--tiles-version` | 3D Tiles version of `tileset.json`. `1.1` (default). `2.0` is reserved and exits with an error until the OGC 3D Tiles 2.0 standard is ratified |
 | `--max-sh-degree` | Maximum SH degree (0–3) |
-| `--max-splats-per-tile` | Override automatic tile sizing |
+| `--max-splats-per-tile` | Override automatic tile sizing (in `lod` mode also the splat budget of every tile) |
 | `--min-tile-size` | Minimum octree cell size |
+| `--error-scale` | `lod` only. Multiplier on every tile's `geometricError` (default 16) |
+| `--lod-max-inflate` | `lod` only. Maximum enlargement of a kept splat per level (default 2) |
 | `--fraction` | Subsample splats for testing |
+
+#### Tiling modes
+
+| | `flat` (default) | `lod` |
+|---|---|---|
+| Content | Leaf tiles only | Every node (root = coarsest) |
+| Output | `tile_XXXX.glb` | `tiles/D<depth>/NNNNNN.glb` (`D0` = root) |
+| Size on disk | 1× splats | More splats (coarse copies in internal tiles) |
+
+How `lod` is built (`lod_tiling.py`):
+
+1. The same octree as `flat` is built. Leaves keep their full-resolution splats.
+2. Bottom-up, each internal node reduces its children's content to at most
+   `--max-splats-per-tile` splats by voxel clustering: one splat per voxel
+   (largest opacity × projected area), enlarged so it covers what the voxel held
+   (capped by `--lod-max-inflate` and by the voxel size).
+3. `geometricError` of an internal tile = median splat diameter of its content ×
+   `--error-scale`; leaves = 0; never increasing towards the leaves.
+   Refinement is `REPLACE`: a parent is swapped for its children, never drawn with them.
+
+Tile conventions (step 3) follow dozeri's `geo/ssog_tiles.py`; the level construction
+(step 2) is this project's own, since LichtFeld's `save_ssog` is not available standalone.
 
 ### Step 3 — Verify Export
 
@@ -407,7 +452,9 @@ against ground truth measurements.
 ```
 3dtiles_georeference_3dgs/
 ├── solve_transform.py
-├── tiles_exporter.py
+├── tiles_exporter.py           # CLI + flat tiling + tile encoding
+├── lod_tiling.py               # hierarchical LOD (--tiling lod)
+├── tileset_writer.py           # tileset.json per 3D Tiles version (1.1; 2.0 reserved)
 ├── verify_tileset.py
 ├── colmap_reader.py
 ├── metashape_parser.py
@@ -463,6 +510,8 @@ number of tiles loaded at once:
 ```javascript
 tileset.maximumScreenSpaceError = 32; // default is 16
 ```
+**3D Tiles 2.0** — `--tiles-version 2.0` is reserved. The writer will be added
+in `tileset_writer.py` once the OGC 3D Tiles 2.0 community standard is ratified.
 
 **PLY outlier filter** — no built-in filter yet. Oblique datasets often contain outlier
 splats far below terrain level that pull the bounding box down. Manual cleaning in
@@ -488,7 +537,9 @@ This project builds upon ideas and implementations from:
 - **[dozeri83/geo-register-plugin](https://github.com/dozeri83/geo-register-plugin)** —
   the original LichtFeld Studio georeferencing plugin. The following components were
   adapted from this work: SPZ encoding, similarity transform estimation, Metashape XML
-  parsing, and 3D Tiles export structure. Special thanks to dozeri83 for creating and
+  parsing, and 3D Tiles export structure. The hierarchical LOD tile conventions
+  (REPLACE refinement, geometricError from median splat diameter × error scale)
+  follow its `geo/ssog_tiles.py`. Special thanks to dozeri83 for creating and
   maintaining this plugin, which served as both the foundation and inspiration for this work.
 
 - **[Niantic SPZ](https://github.com/nianticlabs/spz)** — SPZ v3 binary format specification (MIT License).
