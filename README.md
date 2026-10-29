@@ -445,6 +445,16 @@ During visual inspection in Cesium ion, horizontal positioning appeared consiste
 with known geographic features. Vertical positioning was not independently verified
 against ground truth measurements.
 
+**Hierarchical LOD (`--tiling lod`)** — ITB Ganesha (Full Metashape PLY, 7,612,828 splats):
+
+| Mode | Splats written | Size |
+|---|---|---|
+| `flat` | 7,612,828 | ~174 MB |
+| `lod` | 12,442,117 (1.63×), 770 tiles (97 internal + 673 leaf) | ~280 MB |
+
+Packaged as `.3tz`, the `lod` tileset loads in ArcGIS Pro as a Gaussian splat layer.
+Popping is visible when tiles switch between levels (`REPLACE` refinement).
+
 ---
 
 ## File Structure
@@ -510,6 +520,8 @@ number of tiles loaded at once:
 ```javascript
 tileset.maximumScreenSpaceError = 32; // default is 16
 ```
+**LOD popping** — switching from a coarse tile to its children is visible as popping.
+
 **3D Tiles 2.0** — `--tiles-version 2.0` is reserved. The writer will be added
 in `tileset_writer.py` once the OGC 3D Tiles 2.0 community standard is ratified.
 
